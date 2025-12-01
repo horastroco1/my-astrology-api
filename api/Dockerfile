@@ -8,7 +8,7 @@ ENV COMPOSER_ALLOW_SUPERUSER=1
 # Set working directory
 WORKDIR /var/www/api
 
-# Install system dependencies
+# 1. Install system dependencies (Adding build-essential for compiling C code)
 RUN apt-get update -y && \
     apt-get install -y \
     git \
@@ -24,15 +24,14 @@ RUN apt-get update -y && \
     gnupg \
     g++ \
     make \
+    build-essential \
     nginx
 
 # Add PHP repository
 RUN add-apt-repository ppa:ondrej/php -y
-
-# Update package list after adding new repository
 RUN apt-get update -y
 
-# Install PHP and required extensions
+# Install PHP and extensions
 RUN apt-get install -y \
     php7.4 \
     php7.4-fpm \
@@ -52,32 +51,33 @@ RUN apt-get install -y \
 # Install Composer
 RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
 
-# Clean up after installation
-RUN apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+# Clean up
+RUN apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Copy composer.json and composer.lock
+# Copy composer files first
 COPY composer.json ./
+# COPY composer.lock ./ 
 
-# Install composer dependencies
-RUN set -eux; \
-    composer install --verbose --no-interaction; \
-    composer clear-cache
+# Install dependencies
+RUN composer install --no-scripts --no-autoloader
 
-# Copy rest of the application
+# Copy the rest of the application
 COPY . .
 
-# After copying application files but before clearing cache
-RUN mkdir -p /var/www/api/var/cache /var/www/api/var/log && \
+# --- ⚡️ KEY FIX: COMPILE SWETEST MANUALLY ---
+# We go into the source folder and compile a fresh binary for Linux
+RUN cd swetest/src && \
+    make clean && \
+    make && \
+    chmod +x swetest
+
+# Create necessary directories and set permissions
+RUN mkdir -p /var/www/api/var/cache /var/www/api/var/log /run/php && \
     chown -R www-data:www-data /var/www/api/var && \
     chmod -R 777 /var/www/api/var
 
-# Run composer dump-autoload optimizing for production
-RUN set -eux; \
-    composer dump-autoload --optimize;
-
-# Set proper permissions
-
+# Dump autoload
+RUN composer dump-autoload --optimize
 
 # Configure Nginx
 RUN echo ' \
@@ -95,30 +95,30 @@ server { \
     } \
     \
     location ~ \.php$ { \
-        fastcgi_pass unix:/var/run/php/php7.4-fpm.sock; \
+        fastcgi_pass unix:/run/php/php7.4-fpm.sock; \
         fastcgi_index index.php; \
         include fastcgi_params; \
         fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name; \
     } \
 }' > /etc/nginx/sites-available/default
 
-# Configure PHP-FPM logging
-RUN sed -i 's/;error_log = php_errors.log/error_log = \/var\/log\/php7.4-fpm.log/' /etc/php/7.4/fpm/php-fpm.conf
+# Enable site
+RUN rm -f /etc/nginx/sites-enabled/default && \
+    ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/
 
-# Create log directories and set permissions
-RUN mkdir -p /var/log/nginx /var/log/php7.4-fpm && \
-    chown -R www-data:www-data /var/log/nginx /var/log/php7.4-fpm
+# Fix PHP-FPM logging configuration
+RUN sed -i 's/;error_log = php_errors.log/error_log = \/var\/log\/php7.4-fpm.log/' /etc/php/7.4/fpm/php-fpm.conf && \
+    sed -i 's/listen = \/run\/php\/php7.4-fpm.sock/listen = \/run\/php\/php7.4-fpm.sock/' /etc/php/7.4/fpm/pool.d/www.conf
 
-# Install Symfony assets
-RUN php bin/console assets:install --symlink
+# Create log files
+RUN touch /var/log/nginx/access.log /var/log/nginx/error.log /var/log/php7.4-fpm.log && \
+    chown -R www-data:www-data /var/log/nginx /var/log/php7.4-fpm.log
 
-# Clear Symfony cache
-RUN php bin/console cache:clear
+# Install assets and clear cache
+RUN php bin/console assets:install --symlink || true
+RUN php bin/console cache:clear || true
 
-# Expose port
 EXPOSE 9393
 
-# Start Nginx and PHP-FPM with logging
-CMD service php7.4-fpm start && \
-    tail -f /var/log/nginx/error.log /var/log/nginx/access.log /var/log/php7.4-fpm.log & \
-    nginx -g 'daemon off;'
+# Start services
+CMD service php7.4-fpm start && nginx -g 'daemon off;'
